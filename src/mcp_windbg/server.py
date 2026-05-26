@@ -1,4 +1,5 @@
 import os
+import time
 import traceback
 import glob
 import winreg
@@ -126,7 +127,8 @@ def get_or_create_session(
     cdb_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
     timeout: int = 30,
-    verbose: bool = False
+    verbose: bool = False,
+    init_timeout: Optional[int] = None,
 ) -> CDBSession:
     """Get an existing CDB session or create a new one."""
     if not dump_path and not connection_string:
@@ -140,6 +142,30 @@ def get_or_create_session(
     else:
         session_id = f"remote:{connection_string}"
 
+    # If we have a cached session but it has died (CDB process exited or
+    # the stdout reader thread crashed -- e.g. on a non-UTF8 byte from `du`),
+    # or the session has been marked broken after a failed resync, drop it so
+    # we transparently recreate a fresh one instead of handing back a zombie
+    # that would time out / refuse on every command.
+    cached = active_sessions.get(session_id)
+    if cached is not None:
+        proc_dead = cached.process is None or cached.process.poll() is not None
+        reader_dead = not getattr(cached, "_reader_alive", True)
+        broken = getattr(cached, "_broken", False)
+        if proc_dead or reader_dead or broken:
+            logger.warning(
+                "Discarding dead CDB session %s (proc_dead=%s, reader_dead=%s, broken=%s, "
+                "reader_error=%s, broken_reason=%s); a new session will be created.",
+                session_id, proc_dead, reader_dead, broken,
+                getattr(cached, "_reader_error", None),
+                getattr(cached, "_broken_reason", None),
+            )
+            try:
+                cached.shutdown()
+            except Exception:
+                pass
+            active_sessions.pop(session_id, None)
+
     if session_id not in active_sessions or active_sessions[session_id] is None:
         try:
             session = CDBSession(
@@ -148,7 +174,8 @@ def get_or_create_session(
                 cdb_path=cdb_path,
                 symbols_path=symbols_path,
                 timeout=timeout,
-                verbose=verbose
+                verbose=verbose,
+                init_timeout=init_timeout,
             )
             active_sessions[session_id] = session
             return session
@@ -210,6 +237,7 @@ async def serve(
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
+    init_timeout: Optional[int] = None,
 ) -> None:
     """Run the WinDbg MCP server with stdio transport.
 
@@ -218,8 +246,9 @@ async def serve(
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
+        init_timeout: Timeout for initial CDB prompt (default: max(60, timeout*4))
     """
-    server = _create_server(cdb_path, symbols_path, timeout, verbose)
+    server = _create_server(cdb_path, symbols_path, timeout, verbose, init_timeout)
 
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
@@ -233,6 +262,7 @@ async def serve_http(
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
+    init_timeout: Optional[int] = None,
 ) -> None:
     """Run the WinDbg MCP server with Streamable HTTP transport.
 
@@ -249,7 +279,7 @@ async def serve_http(
     from starlette.types import Receive, Scope, Send
     import uvicorn
 
-    server = _create_server(cdb_path, symbols_path, timeout, verbose)
+    server = _create_server(cdb_path, symbols_path, timeout, verbose, init_timeout)
 
     # Create the session manager
     session_manager = StreamableHTTPSessionManager(
@@ -288,6 +318,7 @@ def _create_server(
     symbols_path: Optional[str] = None,
     timeout: int = 30,
     verbose: bool = False,
+    init_timeout: Optional[int] = None,
 ) -> Server:
     """Create and configure the MCP server with all tools and prompts.
 
@@ -296,6 +327,8 @@ def _create_server(
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
+        init_timeout: Timeout for initial CDB prompt; falls back to a CDBSession
+            heuristic of max(60, timeout*4) when None.
 
     Returns:
         Configured Server instance
@@ -365,6 +398,13 @@ def _create_server(
 
     @server.call_tool()
     async def call_tool(name, arguments: dict) -> list[TextContent]:
+        # Mask noisy fields when logging arguments to keep logs readable.
+        try:
+            log_args = {k: (v if k != "command" else (v[:200] + "...") if isinstance(v, str) and len(v) > 200 else v) for k, v in arguments.items()}
+        except Exception:
+            log_args = arguments
+        _tool_started_at = time.monotonic()
+        logger.info("MCP tool begin: name=%s args=%s", name, log_args)
         try:
             if name == "open_windbg_dump":
                 # Check if dump_path is missing or empty
@@ -400,7 +440,8 @@ def _create_server(
 
                 args = OpenWindbgDump(**arguments)
                 session = get_or_create_session(
-                    dump_path=args.dump_path, cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    dump_path=args.dump_path, cdb_path=cdb_path, symbols_path=symbols_path,
+                    timeout=timeout, verbose=verbose, init_timeout=init_timeout,
                 )
 
                 results = []
@@ -430,7 +471,9 @@ def _create_server(
             elif name == "open_windbg_remote":
                 args = OpenWindbgRemote(**arguments)
                 session = get_or_create_session(
-                    connection_string=args.connection_string, cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    connection_string=args.connection_string, cdb_path=cdb_path,
+                    symbols_path=symbols_path, timeout=timeout, verbose=verbose,
+                    init_timeout=init_timeout,
                 )
 
                 results = []
@@ -465,7 +508,8 @@ def _create_server(
                 args = RunWindbgCmdParams(**arguments)
                 session = get_or_create_session(
                     dump_path=args.dump_path, connection_string=args.connection_string,
-                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout,
+                    verbose=verbose, init_timeout=init_timeout,
                 )
                 output = session.send_command(args.command)
 
@@ -478,7 +522,8 @@ def _create_server(
                 args = SendCtrlBreakParams(**arguments)
                 session = get_or_create_session(
                     dump_path=args.dump_path, connection_string=args.connection_string,
-                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout, verbose=verbose
+                    cdb_path=cdb_path, symbols_path=symbols_path, timeout=timeout,
+                    verbose=verbose, init_timeout=init_timeout,
                 )
                 session.send_ctrl_break()
                 target = args.dump_path if args.dump_path else f"remote: {args.connection_string}"
@@ -568,14 +613,27 @@ def _create_server(
                 message=f"Unknown tool: {name}"
             ))
 
-        except McpError:
+        except McpError as e:
+            logger.warning(
+                "MCP tool ended with McpError: name=%s elapsed=%.2fs err=%s",
+                name, time.monotonic() - _tool_started_at, getattr(e, "args", e),
+            )
             raise
         except Exception as e:
             traceback_str = traceback.format_exc()
+            logger.error(
+                "MCP tool failed: name=%s elapsed=%.2fs error=%s\n%s",
+                name, time.monotonic() - _tool_started_at, e, traceback_str,
+            )
             raise McpError(ErrorData(
                 code=INTERNAL_ERROR,
                 message=f"Error executing tool {name}: {str(e)}\n{traceback_str}"
             ))
+        finally:
+            logger.info(
+                "MCP tool end: name=%s elapsed=%.2fs",
+                name, time.monotonic() - _tool_started_at,
+            )
 
     # Prompt constants
     DUMP_TRIAGE_PROMPT_NAME = "dump-triage"
