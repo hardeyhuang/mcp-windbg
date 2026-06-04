@@ -2,6 +2,8 @@
 
 A Model Context Protocol server that bridges AI models with WinDbg for crash dump analysis and remote debugging.
 
+> **Fork notice**: This repository is a fork of [svnscha/mcp-windbg](https://github.com/svnscha/mcp-windbg), maintained at **[hardeyhuang/mcp-windbg](https://github.com/hardeyhuang/mcp-windbg)** with additional fixes and features (e.g. idle session auto-cleanup via `--idle-timeout`). The PyPI package `mcp-windbg` tracks the upstream project, **not this fork** — to get the changes here you must install directly from this Git repo (see [Installation](#installation) below).
+
 <!-- mcp-name: io.github.svnscha/mcp-windbg -->
 
 ## Overview
@@ -34,9 +36,40 @@ Not a magical auto-fix solution. It's a Python wrapper around CDB that leverages
 > In enterprise environments, MCP server usage might be restricted by organizational policies. Check with your IT team about AI tool usage and ensure you have the necessary permissions before proceeding.
 
 ### Installation
+
+> **Note**: This is a **fork** of [svnscha/mcp-windbg](https://github.com/svnscha/mcp-windbg) maintained at [hardeyhuang/mcp-windbg](https://github.com/hardeyhuang/mcp-windbg). It is **not** published to PyPI under this fork's changes, so `pip install mcp-windbg` will give you the upstream package, **without** the fixes/features added here (e.g. `--idle-timeout`, etc). Install directly from this Git repository instead.
+
+**Option A — Install from this fork's Git repo (recommended):**
 ```bash
-pip install mcp-windbg
+# Latest main branch
+pip install git+https://github.com/hardeyhuang/mcp-windbg.git
+
+# Or pin to a specific tag / commit
+pip install git+https://github.com/hardeyhuang/mcp-windbg.git@main
 ```
+
+**Option B — Install from a local clone (for development):**
+```bash
+git clone https://github.com/hardeyhuang/mcp-windbg.git
+cd mcp-windbg
+
+# pip (editable install)
+pip install -e .
+
+# or with uv (recommended, matches CI)
+uv sync
+```
+
+**Option C — Run without installing, using `uv` / `pipx` directly from Git:**
+```bash
+# uv
+uvx --from git+https://github.com/hardeyhuang/mcp-windbg.git mcp-windbg --help
+
+# pipx
+pipx run --spec git+https://github.com/hardeyhuang/mcp-windbg.git mcp-windbg --help
+```
+
+After installation the `mcp-windbg` console script and the `python -m mcp_windbg` module entry point both become available.
 
 ## Transport Options
 
@@ -64,23 +97,32 @@ Endpoint: `http://127.0.0.1:8000/mcp`
 
 ### Command Line Options
 
-```
---transport {stdio,streamable-http}  Transport protocol (default: stdio)
---host HOST                              HTTP server host (default: 127.0.0.1)
---port PORT                              HTTP server port (default: 8000)
---cdb-path PATH                          Custom path to cdb.exe
---symbols-path PATH                      Custom symbols path
---timeout SECONDS                        Command timeout (default: 30)
---verbose                                Enable verbose output
-```
+All flags are optional; the defaults shown below are the same ones the binary will pick if the flag is omitted. Copy these into the `args` array of any IDE config (next section) and tweak as needed.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--transport {stdio,streamable-http}` | `stdio` | Transport protocol. `stdio` is what every desktop MCP client uses; `streamable-http` is for running the server as a separate HTTP service. |
+| `--host HOST` | `127.0.0.1` | HTTP bind host (only used with `streamable-http`). |
+| `--port PORT` | `8000` | HTTP bind port (only used with `streamable-http`). |
+| `--cdb-path PATH` | auto-detect | Custom path to `cdb.exe`. Auto-detected from Windows Kits / Debugging Tools / Microsoft Store WinDbg. Override if you have a portable copy. |
+| `--symbols-path PATH` | from `_NT_SYMBOL_PATH` env | Custom symbols path. Equivalent to setting `_NT_SYMBOL_PATH`. Example: `SRV*C:\Symbols*https://msdl.microsoft.com/download/symbols`. |
+| `--timeout SECONDS` | `30` | Per-command timeout. Increase for very slow `!analyze -v` on large dumps. |
+| `--init-timeout SECONDS` | `max(60, timeout*4)` | Timeout for the *first* CDB prompt (cold-start dump load + initial symbol download). Bump on slow networks. |
+| `--idle-timeout SECONDS` | `1200` (20 min) | Auto-close idle CDB sessions after N seconds of inactivity to release memory. The next command transparently respawns CDB. Set `0` to disable. |
+| `--verbose` | off | Enable verbose output (also bumps log level to `DEBUG`). |
+| `--log-level LEVEL` | `INFO` (or `DEBUG` if `--verbose`) | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `--log-file PATH` | none | Also write logs to this file. Logs always also go to stderr (stdout is reserved for the MCP JSON-RPC stream). |
+
+> **Important**: under the default `stdio` transport, the server uses **stdout** for JSON-RPC. Never add `print(...)` or `--log-file -` style configs that would write to stdout — use `--log-file` or stderr instead.
 
 
-## Configuration for Visual Studio Code
+## IDE / Client Configuration
 
-To make MCP servers available in all your workspaces, use the global user configuration:
+All examples below use the `stdio` transport (recommended for desktop IDEs) and pre-fill **every supported parameter with its default value** so you can comment out / delete what you don't need. Replace the symbol cache path (`C:\Symbols`) with whatever you actually use.
 
-1. Press `F1`, type `>` and select **MCP: Open User Configuration**.
-2. Paste the following JSON snippet into your user configuration:
+### 1. Visual Studio Code (GitHub Copilot / Agent Mode)
+
+Press `F1` → **MCP: Open User Configuration**, then paste:
 
 ```json
 {
@@ -88,7 +130,13 @@ To make MCP servers available in all your workspaces, use the global user config
         "mcp_windbg": {
             "type": "stdio",
             "command": "python",
-            "args": ["-m", "mcp_windbg"],
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200"
+            ],
             "env": {
                 "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
             }
@@ -97,30 +145,187 @@ To make MCP servers available in all your workspaces, use the global user config
 }
 ```
 
-This enables MCP Windbg in any workspace, without needing a local `.vscode/mcp.json` file.
-
-### HTTP Transport Configuration
-
-For scenarios where you need to run the MCP server separately (e.g., remote access, shared server, or debugging the server itself), you can use the HTTP transport:
-
-**1. Start the server manually:**
-```bash
-python -m mcp_windbg --transport streamable-http --host 127.0.0.1 --port 8000
+To bind to a custom CDB / symbols path, add:
+```json
+"args": [
+    "-m", "mcp_windbg",
+    "--cdb-path", "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe",
+    "--symbols-path", "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols",
+    "--timeout", "30",
+    "--init-timeout", "120",
+    "--idle-timeout", "1200",
+    "--log-file", "C:\\Logs\\mcp-windbg.log"
+]
 ```
 
-**2. Configure VS Code to connect via HTTP:**
+### 2. Claude Desktop
+
+Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+
 ```json
 {
-    "servers": {
-        "mcp_windbg_http": {
-            "type": "http",
-            "url": "http://localhost:8000/mcp"
+    "mcpServers": {
+        "mcp_windbg": {
+            "command": "python",
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200"
+            ],
+            "env": {
+                "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+            }
         }
     }
 }
 ```
 
-> **Workspace-specific and alternative configuration**: See [Installation documentation](https://github.com/svnscha/mcp-windbg/wiki/Installation) for details on configuring Claude Desktop, Cline, and other clients, or for workspace-only setup.
+Then fully quit and restart Claude Desktop (the tray icon, not just the window).
+
+### 3. Cursor
+
+Edit `%USERPROFILE%\.cursor\mcp.json` (global) or `<project>\.cursor\mcp.json` (per-project):
+
+```json
+{
+    "mcpServers": {
+        "mcp_windbg": {
+            "command": "python",
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200"
+            ],
+            "env": {
+                "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+            }
+        }
+    }
+}
+```
+
+### 4. Windsurf
+
+Edit `%USERPROFILE%\.codeium\windsurf\mcp_config.json`:
+
+```json
+{
+    "mcpServers": {
+        "mcp_windbg": {
+            "command": "python",
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200"
+            ],
+            "env": {
+                "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+            }
+        }
+    }
+}
+```
+
+### 5. Cline (VS Code extension)
+
+Open the Cline panel → `MCP Servers` → `Configure MCP Servers`, then:
+
+```json
+{
+    "mcpServers": {
+        "mcp_windbg": {
+            "command": "python",
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200"
+            ],
+            "env": {
+                "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+            },
+            "disabled": false,
+            "autoApprove": []
+        }
+    }
+}
+```
+
+### 6. CodeBuddy / Continue / other generic MCP clients
+
+Most clients accept the same shape. Use whatever JSON file the client documents and reuse the `command` + `args` + `env` block above.
+
+```json
+{
+    "mcpServers": {
+        "mcp_windbg": {
+            "command": "python",
+            "args": [
+                "-m", "mcp_windbg",
+                "--transport", "stdio",
+                "--timeout", "30",
+                "--init-timeout", "120",
+                "--idle-timeout", "1200",
+                "--verbose"
+            ],
+            "env": {
+                "_NT_SYMBOL_PATH": "SRV*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+            }
+        }
+    }
+}
+```
+
+> **Tip**: If `python` is not on `PATH` (or you installed into a virtualenv / `uv` env), replace `"command": "python"` with the absolute interpreter path, e.g. `"C:\\Python312\\python.exe"` or `"D:\\repos\\mcp-windbg\\.venv\\Scripts\\python.exe"`.
+>
+> To skip a system-wide install entirely, you can have the IDE launch the server straight from this fork's Git repo via `uvx`:
+> ```json
+> "command": "uvx",
+> "args": [
+>     "--from", "git+https://github.com/hardeyhuang/mcp-windbg.git",
+>     "mcp-windbg",
+>     "--transport", "stdio",
+>     "--timeout", "30",
+>     "--init-timeout", "120",
+>     "--idle-timeout", "1200"
+> ]
+> ```
+
+### HTTP Transport (shared / remote server)
+
+For scenarios where you want the MCP server to run as a long-lived service (remote access, shared symbol cache, easier debugging), use `streamable-http`:
+
+**1. Start the server manually:**
+```bash
+python -m mcp_windbg ^
+    --transport streamable-http ^
+    --host 127.0.0.1 ^
+    --port 8000 ^
+    --timeout 30 ^
+    --init-timeout 120 ^
+    --idle-timeout 1200
+```
+
+**2. Configure your IDE to connect over HTTP** (VS Code shown — most clients have an equivalent):
+```json
+{
+    "servers": {
+        "mcp_windbg_http": {
+            "type": "http",
+            "url": "http://127.0.0.1:8000/mcp"
+        }
+    }
+}
+```
+
+> **Workspace-specific and alternative configuration**: See [Installation documentation](https://github.com/svnscha/mcp-windbg/wiki/Installation) for details on workspace-only setup and additional clients.
 
 Once configured, restart your MCP client and start debugging:
 

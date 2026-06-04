@@ -191,6 +191,12 @@ class CDBSession:
 
         self.output_lines = []
         self.lock = threading.Lock()
+        # Tracks the last time the session received any caller-driven activity
+        # (command or ctrl+break). Used by the idle reaper in server.py to
+        # auto-shutdown sessions that have been silent for too long, so cdb.exe
+        # does not occupy memory indefinitely. Initialized to "now" so a brand
+        # new session is not immediately reaped before its first command.
+        self.last_activity_at = time.monotonic()
         # Serializes the entire "write command -> wait for marker" transaction.
         # Without this, two concurrent send_command() calls would race: each
         # writes its own marker, and one thread can consume the OTHER thread's
@@ -379,7 +385,15 @@ class CDBSession:
         # a single stdin/stdout, so two callers writing their own markers in
         # parallel would deterministically corrupt each other's output.
         with self._command_lock:
-            return self._send_command_locked(command, timeout)
+            # Refresh idle timer both before and after the command:
+            #   - "before" prevents the reaper from killing the session in the
+            #     middle of a long-running command (e.g. !analyze).
+            #   - "after" captures the actual end-of-activity timestamp.
+            self.last_activity_at = time.monotonic()
+            try:
+                return self._send_command_locked(command, timeout)
+            finally:
+                self.last_activity_at = time.monotonic()
 
     def _send_command_locked(self, command: str, timeout: Optional[int]) -> List[str]:
         # Fail fast if the reader thread has died or the underlying CDB
@@ -611,6 +625,9 @@ class CDBSession:
             # On Windows, deliver CTRL+BREAK to the new process group we created
             logger.info("Sending CTRL+BREAK to CDB (pid=%s)", self.process.pid)
             self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            # Treat ctrl+break as user-driven activity: don't let the idle
+            # reaper kill the session right after the user just interrupted it.
+            self.last_activity_at = time.monotonic()
         except Exception as e:
             logger.exception("Failed to send CTRL+BREAK")
             raise CDBError(f"Failed to send CTRL+BREAK: {str(e)}")

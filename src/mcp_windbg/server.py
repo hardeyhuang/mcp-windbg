@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import traceback
 import glob
 import winreg
@@ -29,8 +30,116 @@ from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
-# Dictionary to store CDB sessions keyed by dump file path
+# Default idle timeout (seconds) before an inactive CDB session is auto-closed
+# to release memory held by cdb.exe and its symbol caches. Can be overridden
+# via the --idle-timeout CLI flag. Set to 0 to disable.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 20 * 60  # 20 minutes
+
+# Dictionary to store CDB sessions keyed by dump file path / remote target.
+# Protected by `_sessions_lock` because the idle-reaper background thread can
+# now mutate it concurrently with the request-handling threads.
 active_sessions: Dict[str, CDBSession] = {}
+_sessions_lock = threading.Lock()
+
+# Idle reaper state. The reaper is a single daemon thread shared across all
+# transports; we lazily start it on the first call to start_idle_reaper().
+_reaper_thread: Optional[threading.Thread] = None
+_reaper_stop_event = threading.Event()
+_reaper_idle_timeout: float = DEFAULT_IDLE_TIMEOUT_SECONDS
+
+
+def _reap_idle_sessions(idle_timeout: float) -> None:
+    """Close any sessions whose last_activity_at is older than idle_timeout.
+
+    Called periodically by the reaper thread. Holds `_sessions_lock` only
+    while scanning / popping, and runs `shutdown()` outside the lock so a
+    slow shutdown does not block new requests.
+    """
+    if idle_timeout <= 0:
+        return
+    now = time.monotonic()
+    to_close: list[tuple[str, CDBSession]] = []
+    with _sessions_lock:
+        for sid, sess in list(active_sessions.items()):
+            if sess is None:
+                active_sessions.pop(sid, None)
+                continue
+            last = getattr(sess, "last_activity_at", None)
+            if last is None:
+                # Older sessions without the attribute: treat as just-active
+                # to avoid surprise teardown on upgrade.
+                continue
+            idle_for = now - last
+            if idle_for >= idle_timeout:
+                to_close.append((sid, sess))
+                active_sessions.pop(sid, None)
+
+    for sid, sess in to_close:
+        idle_for = now - getattr(sess, "last_activity_at", now)
+        logger.info(
+            "Auto-closing idle CDB session %s after %.1fs of inactivity "
+            "(idle_timeout=%.0fs) to release memory.",
+            sid, idle_for, idle_timeout,
+        )
+        try:
+            sess.shutdown()
+        except Exception:
+            logger.exception("Error while auto-closing idle session %s", sid)
+
+
+def _idle_reaper_loop() -> None:
+    """Background loop that periodically reaps idle sessions."""
+    # Check ~once a minute, but at least often enough that we don't massively
+    # overshoot the configured timeout for very short timeouts (used in tests).
+    while not _reaper_stop_event.is_set():
+        timeout = _reaper_idle_timeout
+        if timeout <= 0:
+            # Disabled: just sleep and re-check periodically in case the
+            # caller updates the timeout at runtime.
+            interval = 60.0
+        else:
+            interval = max(5.0, min(60.0, timeout / 4.0))
+        # Wait with early-wake support so shutdown is responsive.
+        if _reaper_stop_event.wait(timeout=interval):
+            return
+        try:
+            _reap_idle_sessions(_reaper_idle_timeout)
+        except Exception:
+            logger.exception("Idle reaper iteration failed; continuing.")
+
+
+def start_idle_reaper(idle_timeout: float) -> None:
+    """Configure and (lazily) start the idle reaper thread.
+
+    Safe to call multiple times: only the first call spawns the thread;
+    subsequent calls just update the timeout.
+    """
+    global _reaper_thread, _reaper_idle_timeout
+    _reaper_idle_timeout = float(idle_timeout) if idle_timeout else 0.0
+    if _reaper_thread is not None and _reaper_thread.is_alive():
+        logger.info(
+            "Idle reaper already running; updated idle_timeout=%.0fs",
+            _reaper_idle_timeout,
+        )
+        return
+    if _reaper_idle_timeout <= 0:
+        logger.info("Idle reaper disabled (idle_timeout<=0).")
+        return
+    _reaper_stop_event.clear()
+    t = threading.Thread(
+        target=_idle_reaper_loop, name="cdb-idle-reaper", daemon=True,
+    )
+    _reaper_thread = t
+    t.start()
+    logger.info(
+        "Idle reaper started: sessions inactive for >%.0fs will be auto-closed.",
+        _reaper_idle_timeout,
+    )
+
+
+def stop_idle_reaper() -> None:
+    """Signal the reaper thread to stop. Used in tests / shutdown."""
+    _reaper_stop_event.set()
 
 def get_local_dumps_path() -> Optional[str]:
     """Get the local dumps path from the Windows registry."""
@@ -147,45 +256,89 @@ def get_or_create_session(
     # or the session has been marked broken after a failed resync, drop it so
     # we transparently recreate a fresh one instead of handing back a zombie
     # that would time out / refuse on every command.
-    cached = active_sessions.get(session_id)
-    if cached is not None:
-        proc_dead = cached.process is None or cached.process.poll() is not None
-        reader_dead = not getattr(cached, "_reader_alive", True)
-        broken = getattr(cached, "_broken", False)
-        if proc_dead or reader_dead or broken:
-            logger.warning(
-                "Discarding dead CDB session %s (proc_dead=%s, reader_dead=%s, broken=%s, "
-                "reader_error=%s, broken_reason=%s); a new session will be created.",
-                session_id, proc_dead, reader_dead, broken,
-                getattr(cached, "_reader_error", None),
-                getattr(cached, "_broken_reason", None),
-            )
-            try:
-                cached.shutdown()
-            except Exception:
-                pass
-            active_sessions.pop(session_id, None)
+    #
+    # Note: the idle reaper thread can also mutate active_sessions, so all
+    # reads/writes here go through _sessions_lock.
+    with _sessions_lock:
+        cached = active_sessions.get(session_id)
+        dead_to_shutdown: Optional[CDBSession] = None
+        if cached is not None:
+            proc_dead = cached.process is None or cached.process.poll() is not None
+            reader_dead = not getattr(cached, "_reader_alive", True)
+            broken = getattr(cached, "_broken", False)
+            if proc_dead or reader_dead or broken:
+                logger.warning(
+                    "Discarding dead CDB session %s (proc_dead=%s, reader_dead=%s, broken=%s, "
+                    "reader_error=%s, broken_reason=%s); a new session will be created.",
+                    session_id, proc_dead, reader_dead, broken,
+                    getattr(cached, "_reader_error", None),
+                    getattr(cached, "_broken_reason", None),
+                )
+                dead_to_shutdown = cached
+                active_sessions.pop(session_id, None)
+                cached = None
 
-    if session_id not in active_sessions or active_sessions[session_id] is None:
+        existing = active_sessions.get(session_id) if cached is None else cached
+
+    # Shutdown the dead session outside the lock to avoid blocking other
+    # request threads.
+    if dead_to_shutdown is not None:
         try:
-            session = CDBSession(
-                dump_path=dump_path,
-                remote_connection=connection_string,
-                cdb_path=cdb_path,
-                symbols_path=symbols_path,
-                timeout=timeout,
-                verbose=verbose,
-                init_timeout=init_timeout,
-            )
-            active_sessions[session_id] = session
-            return session
-        except Exception as e:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Failed to create CDB session: {str(e)}"
-            ))
+            dead_to_shutdown.shutdown()
+        except Exception:
+            pass
 
-    return active_sessions[session_id]
+    if existing is not None:
+        # Touch activity timestamp so a session that was about to be reaped
+        # right after this check still survives until end of this call.
+        try:
+            existing.last_activity_at = time.monotonic()
+        except Exception:
+            pass
+        return existing
+
+    # No live session: create one. We deliberately create OUTSIDE the lock
+    # because CDBSession.__init__ can take many seconds (cold-start symbol
+    # download), and holding the global lock that long would serialize all
+    # incoming requests.
+    try:
+        session = CDBSession(
+            dump_path=dump_path,
+            remote_connection=connection_string,
+            cdb_path=cdb_path,
+            symbols_path=symbols_path,
+            timeout=timeout,
+            verbose=verbose,
+            init_timeout=init_timeout,
+        )
+    except Exception as e:
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Failed to create CDB session: {str(e)}"
+        ))
+
+    # Race: another thread may have created the same session_id while we were
+    # spinning up CDB. If so, throw ours away and reuse theirs.
+    with _sessions_lock:
+        winner = active_sessions.get(session_id)
+        if winner is not None:
+            losing_session = session
+            session = winner
+        else:
+            active_sessions[session_id] = session
+            losing_session = None
+
+    if losing_session is not None:
+        logger.info(
+            "Race in get_or_create_session for %s; discarding duplicate.",
+            session_id,
+        )
+        try:
+            losing_session.shutdown()
+        except Exception:
+            pass
+
+    return session
 
 
 def unload_session(dump_path: Optional[str] = None, connection_string: Optional[str] = None) -> bool:
@@ -201,16 +354,15 @@ def unload_session(dump_path: Optional[str] = None, connection_string: Optional[
     else:
         session_id = f"remote:{connection_string}"
 
-    if session_id in active_sessions and active_sessions[session_id] is not None:
-        try:
-            active_sessions[session_id].shutdown()
-        except Exception:
-            pass
-        finally:
-            del active_sessions[session_id]
-        return True
-
-    return False
+    with _sessions_lock:
+        sess = active_sessions.pop(session_id, None)
+    if sess is None:
+        return False
+    try:
+        sess.shutdown()
+    except Exception:
+        pass
+    return True
 
 
 def execute_common_analysis_commands(session: CDBSession) -> dict:
@@ -238,6 +390,7 @@ async def serve(
     timeout: int = 30,
     verbose: bool = False,
     init_timeout: Optional[int] = None,
+    idle_timeout: int = DEFAULT_IDLE_TIMEOUT_SECONDS,
 ) -> None:
     """Run the WinDbg MCP server with stdio transport.
 
@@ -247,8 +400,11 @@ async def serve(
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
         init_timeout: Timeout for initial CDB prompt (default: max(60, timeout*4))
+        idle_timeout: Auto-close a session after this many seconds with no
+            commands. Defaults to 1200s (20 min). Set 0 to disable.
     """
     server = _create_server(cdb_path, symbols_path, timeout, verbose, init_timeout)
+    start_idle_reaper(idle_timeout)
 
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
@@ -263,6 +419,7 @@ async def serve_http(
     timeout: int = 30,
     verbose: bool = False,
     init_timeout: Optional[int] = None,
+    idle_timeout: int = DEFAULT_IDLE_TIMEOUT_SECONDS,
 ) -> None:
     """Run the WinDbg MCP server with Streamable HTTP transport.
 
@@ -273,6 +430,8 @@ async def serve_http(
         symbols_path: Optional custom symbols path
         timeout: Command timeout in seconds
         verbose: Whether to enable verbose output
+        idle_timeout: Auto-close a session after this many seconds with no
+            commands. Defaults to 1200s (20 min). Set 0 to disable.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
@@ -280,6 +439,7 @@ async def serve_http(
     import uvicorn
 
     server = _create_server(cdb_path, symbols_path, timeout, verbose, init_timeout)
+    start_idle_reaper(idle_timeout)
 
     # Create the session manager
     session_manager = StreamableHTTPSessionManager(
@@ -704,13 +864,16 @@ def _create_server(
 # Clean up function to ensure all sessions are closed when the server exits
 def cleanup_sessions():
     """Close all active CDB sessions."""
-    for dump_path, session in active_sessions.items():
+    stop_idle_reaper()
+    with _sessions_lock:
+        snapshot = list(active_sessions.items())
+        active_sessions.clear()
+    for _sid, session in snapshot:
         try:
             if session is not None:
                 session.shutdown()
         except Exception:
             pass
-    active_sessions.clear()
 
 
 # Register cleanup on module exit

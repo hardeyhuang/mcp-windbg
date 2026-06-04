@@ -61,6 +61,14 @@ def main():
         help="Timeout in seconds for the initial CDB prompt (loading the dump + first symbol fetch). "
              "Defaults to max(60, timeout*4) which is usually enough for cold starts.",
     )
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=20 * 60,
+        help="Auto-close an idle CDB session after this many seconds with no commands "
+             "(default: 1200 = 20 minutes). The next command for the same dump/remote "
+             "target will transparently spawn a fresh CDB process. Set to 0 to disable.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument(
         "--log-level",
@@ -98,6 +106,7 @@ def main():
             timeout=args.timeout,
             verbose=args.verbose,
             init_timeout=args.init_timeout,
+            idle_timeout=args.idle_timeout,
         ))
     else:
         asyncio.run(serve_http(
@@ -108,6 +117,7 @@ def main():
             timeout=args.timeout,
             verbose=args.verbose,
             init_timeout=args.init_timeout,
+            idle_timeout=args.idle_timeout,
         ))
 
 
